@@ -49,7 +49,37 @@ CREATE TABLE IF NOT EXISTS current_tiles (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (tile_row, tile_col)
 );
+CREATE TABLE IF NOT EXISTS sections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    line_no TEXT NOT NULL UNIQUE,
+    orientation TEXT NOT NULL CHECK (orientation IN ('horizontal', 'vertical')),
+    start_x INTEGER NOT NULL,
+    start_y INTEGER NOT NULL,
+    end_x INTEGER NOT NULL,
+    end_y INTEGER NOT NULL,
+    total_length INTEGER NOT NULL,
+    grid_rows INTEGER NOT NULL,
+    grid_cols INTEGER NOT NULL,
+    tile_size INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS section_tiles (
+    section_id INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
+    tile_row INTEGER NOT NULL,
+    tile_col INTEGER NOT NULL,
+    batch_id INTEGER REFERENCES batches(id),
+    missing INTEGER NOT NULL DEFAULT 0 CHECK (missing IN (0, 1)),
+    PRIMARY KEY (section_id, tile_row, tile_col)
+);
 """
+
+
+class DuplicateSectionError(ValueError):
+    """测线号已登记。"""
+
+    def __init__(self, line_no: str) -> None:
+        super().__init__(f"测线号 {line_no} 已登记")
+        self.line_no = line_no
 
 
 class Database:
@@ -152,6 +182,159 @@ class Database:
         return cur.lastrowid
 
     # ------------------------------------------------------------------
+    # 断面测线登记与取数
+    # ------------------------------------------------------------------
+    def current_tile_batch_ids(
+        self, conn: sqlite3.Connection, tile_ids: list[tuple[int, int]]
+    ) -> dict[tuple[int, int], int]:
+        """只查询指定片号当前的批次版本（不读折线明细，缺片不在结果中）。"""
+        if not tile_ids:
+            return {}
+        where = " OR ".join("(tile_row = ? AND tile_col = ?)" for _ in tile_ids)
+        params = [v for tid in tile_ids for v in tid]
+        rows = conn.execute(
+            "SELECT tile_row AS row, tile_col AS col, batch_id "
+            f"FROM current_tiles WHERE {where}",
+            params,
+        ).fetchall()
+        return {(r["row"], r["col"]): r["batch_id"] for r in rows}
+
+    def register_section(
+        self,
+        conn: sqlite3.Connection,
+        line_no: str,
+        line: dict,
+        tiles: list[dict],
+        grid: dict,
+    ) -> int:
+        """登记测线，并固定其所涉各片当前的版本与本版缺片状态。
+
+        同一测线号重复登记抛 :class:`DuplicateSectionError`。
+        ``tiles`` 元素：``{"row", "col", "batch_id": int | None}``，
+        ``batch_id`` 为 ``None`` 表示登记时该片缺失。
+        """
+        if self.get_section(conn, line_no) is not None:
+            raise DuplicateSectionError(line_no)
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO sections (
+                    line_no, orientation, start_x, start_y, end_x, end_y,
+                    total_length, grid_rows, grid_cols, tile_size
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    line_no,
+                    line["orientation"],
+                    line["start"][0],
+                    line["start"][1],
+                    line["end"][0],
+                    line["end"][1],
+                    line["total_length"],
+                    grid["rows"],
+                    grid["cols"],
+                    grid["tile_size"],
+                ),
+            )
+        except sqlite3.IntegrityError:
+            # 并发登记同一测线号：UNIQUE 约束兜底
+            raise DuplicateSectionError(line_no) from None
+        section_id = cur.lastrowid
+        for t in tiles:
+            conn.execute(
+                "INSERT INTO section_tiles "
+                "(section_id, tile_row, tile_col, batch_id, missing) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    section_id,
+                    t["row"],
+                    t["col"],
+                    t.get("batch_id"),
+                    1 if t.get("batch_id") is None else 0,
+                ),
+            )
+        return section_id
+
+    def get_section(self, conn: sqlite3.Connection, line_no: str) -> dict | None:
+        row = conn.execute(
+            "SELECT id, line_no, orientation, start_x, start_y, end_x, end_y, "
+            "total_length, grid_rows, grid_cols, tile_size, created_at "
+            "FROM sections WHERE line_no = ?",
+            (line_no,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_sections(self, conn: sqlite3.Connection) -> list[dict]:
+        rows = conn.execute(
+            "SELECT id, line_no, orientation, start_x, start_y, end_x, end_y, "
+            "total_length, grid_rows, grid_cols, tile_size, created_at "
+            "FROM sections ORDER BY id"
+        ).fetchall()
+        out = []
+        for r in rows:
+            item = dict(r)
+            item["pinned_tiles"] = [
+                {
+                    "row": t["row"],
+                    "col": t["col"],
+                    "batch_id": t["batch_id"],
+                    "missing": bool(t["missing"]),
+                }
+                for t in conn.execute(
+                    "SELECT tile_row AS row, tile_col AS col, batch_id, missing "
+                    "FROM section_tiles WHERE section_id = ? "
+                    "ORDER BY tile_row, tile_col",
+                    (r["id"],),
+                ).fetchall()
+            ]
+            out.append(item)
+        return out
+
+    def section_snapshot(
+        self, conn: sqlite3.Connection, line_no: str
+    ) -> dict | None:
+        """按登记时固定的版本读取该测线所涉片的折线明细。
+
+        只查询 ``section_tiles`` 中登记的片，且只取登记时固定的 ``batch_id``；
+        其它片（包括后来换片、缺片）完全不读。缺片片不读折线明细。
+        """
+        section = self.get_section(conn, line_no)
+        if section is None:
+            return None
+        rows = conn.execute(
+            """
+            SELECT st.tile_row AS row, st.tile_col AS col,
+                   st.batch_id, st.missing,
+                   r.depth, r.seq, r.points
+            FROM section_tiles st
+            LEFT JOIN tile_revisions r
+              ON r.tile_row = st.tile_row
+             AND r.tile_col = st.tile_col
+             AND r.batch_id = st.batch_id
+            WHERE st.section_id = ?
+            ORDER BY st.tile_row, st.tile_col, r.seq
+            """,
+            (section["id"],),
+        ).fetchall()
+        tiles: dict[tuple[int, int], dict] = {}
+        for r in rows:
+            tile = tiles.setdefault(
+                (r["row"], r["col"]),
+                {
+                    "row": r["row"],
+                    "col": r["col"],
+                    "batch_id": r["batch_id"],
+                    "missing": bool(r["missing"]),
+                    "polylines": [],
+                },
+            )
+            if not r["missing"] and r["points"] is not None:
+                tile["polylines"].append(
+                    {"depth": r["depth"], "points": json.loads(r["points"])}
+                )
+        return {"section": section, "tiles": list(tiles.values())}
+
+    # ------------------------------------------------------------------
     def current_snapshot(self, conn: sqlite3.Connection) -> dict[str, Any]:
         """单事务内读取整图当前版本的一致快照。"""
         grid = self.get_grid(conn)
@@ -207,6 +390,7 @@ class Database:
 
     def reset(self, conn: sqlite3.Connection) -> None:
         conn.executescript(
+            "DELETE FROM section_tiles; DELETE FROM sections; "
             "DELETE FROM current_tiles; DELETE FROM tile_revisions; "
             "DELETE FROM batches; DELETE FROM grid_meta;"
         )
